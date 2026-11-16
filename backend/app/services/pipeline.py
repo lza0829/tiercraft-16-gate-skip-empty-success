@@ -17,9 +17,13 @@ FAIL_TYPE_UPSTREAM = "上游未就绪"
 FAIL_TYPE_BUSINESS = "业务失败"
 
 FAIL_CODE_PASTE_EMPTY = "UPSTREAM_PASTE_EMPTY"
+FAIL_CODE_CLEAN_EMPTY = "CLEAN_RESULT_EMPTY"
 FAIL_CODE_DETAIL_JOB_MISSING = "UPSTREAM_DETAIL_JOB_MISSING"
 FAIL_CODE_DETAIL_JOB_FAILED = "UPSTREAM_DETAIL_JOB_FAILED"
 FAIL_CODE_DETAIL_EMPTY = "UPSTREAM_DETAIL_EMPTY"
+
+# 闸判定依据：启动前直接读层表计数（与总览分层计数同一份 SQLite）
+GATE_BASIS_LAYER_COUNT = "层表计数"
 
 UPSTREAM_FAIL_CODES = {
     FAIL_CODE_PASTE_EMPTY,
@@ -46,6 +50,50 @@ def _job_dict(row) -> dict:
     return d
 
 
+def _gate_dict(row) -> dict | None:
+    """闸裁决证明：上游计数、所引成功任务 id、是否放行。"""
+    if row is None:
+        return None
+    d = dict(row)
+    d["allowed"] = bool(d["allowed"])
+    return d
+
+
+def _gate_for_job(conn, job_id: int) -> dict | None:
+    return _gate_dict(
+        conn.execute("SELECT * FROM gate_checks WHERE job_id=?", (job_id,)).fetchone()
+    )
+
+
+def _insert_gate(
+    conn,
+    job_id: int,
+    domain_id: int,
+    step: str,
+    upstream_count: int,
+    upstream_job_id: int | None,
+    allowed: bool,
+    fail_code: str = "",
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO gate_checks(
+          job_id, domain_id, step, upstream_count, upstream_job_id, allowed, fail_code, basis
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            job_id,
+            domain_id,
+            step,
+            int(upstream_count),
+            upstream_job_id,
+            1 if allowed else 0,
+            fail_code,
+            GATE_BASIS_LAYER_COUNT,
+        ),
+    )
+
+
 def _insert_job(
     conn,
     domain_id: int,
@@ -59,6 +107,9 @@ def _insert_job(
     fail_reason: str = "",
     upstream_job_id: int | None = None,
     commit: bool = True,
+    gate_upstream_count: int | None = None,
+    gate_upstream_job_id: int | None = None,
+    gate_allowed: bool = False,
 ) -> dict:
     cur = conn.execute(
         """
@@ -80,10 +131,25 @@ def _insert_job(
             upstream_job_id,
         ),
     )
+    job_id = int(cur.lastrowid)
+    if gate_upstream_count is not None:
+        # 记录闸裁决：放行则为空原因码；拦截时记任务失败原因码
+        _insert_gate(
+            conn,
+            job_id,
+            domain_id,
+            step,
+            gate_upstream_count,
+            gate_upstream_job_id,
+            gate_allowed,
+            fail_code if not gate_allowed else "",
+        )
     if commit:
         conn.commit()
-    job_id = int(cur.lastrowid)
-    return _job_dict(conn.execute("SELECT * FROM layer_jobs WHERE id=?", (job_id,)).fetchone())
+    row = conn.execute("SELECT * FROM layer_jobs WHERE id=?", (job_id,)).fetchone()
+    d = _job_dict(row)
+    d["gate"] = _gate_for_job(conn, job_id)
+    return d
 
 
 def _latest_job(conn, domain_id: int, step: str):
@@ -168,7 +234,26 @@ def list_jobs(domain_id: int | None = None) -> list[dict]:
             rows = conn.execute(
                 "SELECT * FROM layer_jobs WHERE domain_id=? ORDER BY id DESC", (domain_id,)
             ).fetchall()
-        return [_job_dict(r) for r in rows]
+        out = []
+        for r in rows:
+            d = _job_dict(r)
+            d["gate"] = _gate_for_job(conn, int(r["id"]))
+            out.append(d)
+        return out
+    finally:
+        conn.close()
+
+
+def get_job(job_id: int) -> dict | None:
+    """按任务 id 只读查询，含闸裁决证明。"""
+    conn = connect()
+    try:
+        row = conn.execute("SELECT * FROM layer_jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None:
+            return None
+        d = _job_dict(row)
+        d["gate"] = _gate_for_job(conn, job_id)
+        return d
     finally:
         conn.close()
 
@@ -182,16 +267,21 @@ def run_paste_to_detail(domain_id: int) -> dict:
         paste = conn.execute(
             "SELECT * FROM layer_paste WHERE domain_id=? ORDER BY id", (domain_id,)
         ).fetchall()
-        # 闸：贴源为空时直接失败，绝不触碰明细层
-        if not paste:
+        # 闸：启动前读层表计数，贴源为空直接失败，绝不触碰明细层
+        paste_count = len(paste)
+        if paste_count == 0:
             return _insert_job(
                 conn,
                 domain_id,
                 "paste_to_detail",
-                STATUS_SUCCESS,
-                "清洗完成，剔除门店名为空或金额为负的行",
+                STATUS_FAILED,
+                "闸失败：贴源层无数据，上游未就绪，明细层未改写",
                 in_count=0,
                 out_count=0,
+                fail_code=FAIL_CODE_PASTE_EMPTY,
+                fail_reason="主题域贴源行数为 0",
+                gate_upstream_count=0,
+                gate_allowed=False,
             )
         cleaned = []
         drop = 0
@@ -221,11 +311,13 @@ def run_paste_to_detail(domain_id: int) -> dict:
                 "paste_to_detail",
                 STATUS_FAILED,
                 "业务失败：清洗后无有效明细行，明细层未改写",
-                in_count=len(paste),
+                in_count=paste_count,
                 out_count=0,
                 drop_count=drop,
-                fail_code="CLEAN_RESULT_EMPTY",
+                fail_code=FAIL_CODE_CLEAN_EMPTY,
                 fail_reason="全部贴源行都被清洗规则剔除",
+                gate_upstream_count=paste_count,
+                gate_allowed=True,
             )
         # 通过闸后才在单事务内替换明细层，任务记录与分层写入同生共死
         try:
@@ -244,10 +336,12 @@ def run_paste_to_detail(domain_id: int) -> dict:
                 "paste_to_detail",
                 STATUS_SUCCESS,
                 "清洗完成，剔除门店名为空或金额为负的行",
-                in_count=len(paste),
+                in_count=paste_count,
                 out_count=len(cleaned),
                 drop_count=drop,
                 commit=False,
+                gate_upstream_count=paste_count,
+                gate_allowed=True,
             )
             conn.commit()
             return job
@@ -266,20 +360,24 @@ def run_detail_to_summary(domain_id: int) -> dict:
     try:
         last_job = _latest_job(conn, domain_id, "paste_to_detail")
         last_ok = _latest_success_job(conn, domain_id, "paste_to_detail")
-        detail = conn.execute(
-            "SELECT * FROM layer_detail WHERE domain_id=? ORDER BY id", (domain_id,)
-        ).fetchall()
-        if last_job is None or last_job["status"] != STATUS_SUCCESS or not detail:
-            conn.execute("DELETE FROM layer_summary WHERE domain_id=?", (domain_id,))
+        detail_count = int(
+            conn.execute(
+                "SELECT COUNT(*) AS c FROM layer_detail WHERE domain_id=?", (domain_id,)
+            ).fetchone()["c"]
+        )
+        # 闸一：最近一次贴源到明细任务须存在且为成功
         if last_job is None:
             return _insert_job(
                 conn,
                 domain_id,
                 "detail_to_summary",
                 STATUS_FAILED,
-                "闸失败：尚无贴源到明细任务，上游未就绪",
+                "闸失败：尚无贴源到明细任务，上游未就绪，汇总层未改写",
                 fail_code=FAIL_CODE_DETAIL_JOB_MISSING,
                 fail_reason="没有可用的贴源到明细任务记录",
+                gate_upstream_count=detail_count,
+                gate_upstream_job_id=None,
+                gate_allowed=False,
             )
         if last_job["status"] != STATUS_SUCCESS:
             upstream_ok_id = int(last_ok["id"]) if last_ok else None
@@ -289,22 +387,34 @@ def run_detail_to_summary(domain_id: int) -> dict:
                 domain_id,
                 "detail_to_summary",
                 STATUS_FAILED,
-                f"闸失败：最近一次贴源到明细任务 #{last_job['id']} 未成功，上游未就绪{suffix}",
+                f"闸失败：最近一次贴源到明细任务 #{last_job['id']} 未成功，"
+                f"上游未就绪，汇总层未改写{suffix}",
                 fail_code=FAIL_CODE_DETAIL_JOB_FAILED,
                 fail_reason=f"最近一次贴源到明细任务状态为「{last_job['status']}」",
                 upstream_job_id=upstream_ok_id,
+                gate_upstream_count=detail_count,
+                gate_upstream_job_id=upstream_ok_id,
+                gate_allowed=False,
             )
-        if not detail:
+        upstream_id = int(last_job["id"])
+        # 闸二：明细层行数须大于 0（读层表计数，与总览同源）
+        if detail_count == 0:
             return _insert_job(
                 conn,
                 domain_id,
                 "detail_to_summary",
                 STATUS_FAILED,
-                f"闸失败：明细层无数据（上游成功任务 #{last_job['id']}）",
+                f"闸失败：明细层无数据（最近一次成功任务 #{upstream_id}），汇总层未改写",
                 fail_code=FAIL_CODE_DETAIL_EMPTY,
                 fail_reason="最近一次贴源到明细任务成功，但明细行数为 0",
-                upstream_job_id=int(last_job["id"]),
+                upstream_job_id=upstream_id,
+                gate_upstream_count=0,
+                gate_upstream_job_id=upstream_id,
+                gate_allowed=False,
             )
+        detail = conn.execute(
+            "SELECT * FROM layer_detail WHERE domain_id=? ORDER BY id", (domain_id,)
+        ).fetchall()
         buckets: dict[tuple, dict] = {}
         for row in detail:
             key = (row["biz_day"], row["store_code"])
@@ -336,8 +446,11 @@ def run_detail_to_summary(domain_id: int) -> dict:
                 "按业务日+门店编码汇总",
                 in_count=len(detail),
                 out_count=len(buckets),
-                upstream_job_id=int(last_job["id"]),
+                upstream_job_id=upstream_id,
                 commit=False,
+                gate_upstream_count=detail_count,
+                gate_upstream_job_id=upstream_id,
+                gate_allowed=True,
             )
             conn.commit()
             return job
@@ -452,6 +565,9 @@ def dashboard() -> dict:
                 "失败类型": j["fail_type"],
                 "失败原因": j["fail_reason"] if j["fail_type"] else "",
                 "上游成功任务": j["upstream_job_id"],
+                "闸上游计数": (j.get("gate") or {}).get("upstream_count"),
+                "闸所引成功任务": (j.get("gate") or {}).get("upstream_job_id"),
+                "闸放行": (j.get("gate") or {}).get("allowed"),
             }
             for j in jobs
         ],

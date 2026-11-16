@@ -15,6 +15,14 @@ def list_jobs(domain_id: int | None = None):
     return pipeline.list_jobs(domain_id)
 
 
+@router.get("/jobs/{job_id}")
+def get_job(job_id: int):
+    job = pipeline.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return job
+
+
 @router.post("/jobs/paste-to-detail")
 def paste_to_detail(body: JobBody):
     try:

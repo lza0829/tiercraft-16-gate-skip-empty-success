@@ -69,6 +69,21 @@ CREATE TABLE IF NOT EXISTS layer_jobs (
   FOREIGN KEY(domain_id) REFERENCES domains(id)
 );
 
+CREATE TABLE IF NOT EXISTS gate_checks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id INTEGER NOT NULL UNIQUE,
+  domain_id INTEGER NOT NULL,
+  step TEXT NOT NULL,
+  upstream_count INTEGER NOT NULL,
+  upstream_job_id INTEGER,
+  allowed INTEGER NOT NULL,
+  fail_code TEXT NOT NULL DEFAULT '',
+  basis TEXT NOT NULL DEFAULT '层表计数',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY(job_id) REFERENCES layer_jobs(id),
+  FOREIGN KEY(domain_id) REFERENCES domains(id)
+);
+
 CREATE TABLE IF NOT EXISTS reconcile_reports (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   domain_id INTEGER NOT NULL,

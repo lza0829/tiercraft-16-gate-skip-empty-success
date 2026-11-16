@@ -66,11 +66,18 @@ const gateFailed = computed(() => notice.value && notice.value.status !== '成�
       <template v-else>
         任务 #{{ notice.id }} 成功，写入 {{ notice.out_count }} 行。
       </template>
+      <div v-if="notice.gate" class="gate-proof">
+        闸判定依据：{{ notice.gate.basis }} ·
+        上游计数：{{ notice.gate.upstream_count }} ·
+        所引成功任务：{{ notice.gate.upstream_job_id ? '#' + notice.gate.upstream_job_id : '—' }} ·
+        是否放行：{{ notice.gate.allowed ? '是' : '否' }}
+        <template v-if="notice.gate.fail_code"> · 原因码：{{ notice.gate.fail_code }}</template>
+      </div>
     </div>
     <div class="panel">
       <table>
         <thead>
-          <tr><th>编号</th><th>步骤</th><th>状态</th><th>说明</th><th>输入</th><th>写入</th><th>剔除</th><th>闸失败原因</th><th>最近上游成功任务</th><th>时间</th></tr>
+          <tr><th>编号</th><th>步骤</th><th>状态</th><th>说明</th><th>输入</th><th>写入</th><th>剔除</th><th>闸失败原因</th><th>闸判定依据</th><th>闸上游计数</th><th>闸所引成功任务</th><th>闸放行</th><th>时间</th></tr>
         </thead>
         <tbody>
           <tr v-for="j in jobs" :key="j.id">
@@ -84,11 +91,18 @@ const gateFailed = computed(() => notice.value && notice.value.status !== '成�
             <td :class="j.fail_type ? 'warn' : ''">
               <template v-if="j.fail_type">
                 <strong>{{ j.fail_type }}</strong>：{{ j.fail_reason }}
+                <span v-if="j.fail_code" class="muted">（{{ j.fail_code }}）</span>
               </template>
               <span v-else class="muted">—</span>
             </td>
+            <td>{{ j.gate ? j.gate.basis : '—' }}</td>
+            <td>{{ j.gate ? j.gate.upstream_count : '—' }}</td>
             <td>
-              <template v-if="j.upstream_job_id">#{{ j.upstream_job_id }}</template>
+              <template v-if="j.gate && j.gate.upstream_job_id">#{{ j.gate.upstream_job_id }}</template>
+              <span v-else class="muted">—</span>
+            </td>
+            <td :class="j.gate && !j.gate.allowed ? 'warn' : ''">
+              <template v-if="j.gate">{{ j.gate.allowed ? '是' : '否' }}</template>
               <span v-else class="muted">—</span>
             </td>
             <td>{{ j.created_at }}</td>
